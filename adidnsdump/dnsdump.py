@@ -39,6 +39,8 @@ import dns.resolver
 import dns.name
 import datetime
 import os
+import json
+import tempfile
 from impacket.krb5.ccache import CCache
 from ldap3_ad_auth import bind_kerberos, bind_ntlm
 
@@ -337,7 +339,220 @@ RECORD_TYPE_MAPPING = {
     33: 'SRV'
 }
 
-def main():
+STATE_VERSION = 1
+STATE_SUFFIX = '.state.json'
+
+
+def record_key(row):
+    """Stable identity of an exported record: the tuple (type, name, value)."""
+    return '%s\x1f%s\x1f%s' % (row['type'], row['name'], row['value'])
+
+
+def key_to_row(key):
+    rtype, name, value = key.split('\x1f', 2)
+    return {'type': rtype, 'name': name, 'value': value}
+
+
+def default_state_path(outfile):
+    return outfile + STATE_SUFFIX
+
+
+def parse_record_type_filter(filter_arg):
+    """
+    Parse the --record-types argument into a set of type names as they
+    appear in the CSV output. Accepts type names (A, aaaa, ...) and numeric
+    type IDs. Raises ValueError on unknown values.
+    """
+    if not filter_arg:
+        return None
+    selected = set()
+    for token in filter_arg.split(','):
+        token = token.strip()
+        if not token:
+            continue
+        if token.isdigit():
+            type_id = int(token)
+            if type_id not in RECORD_TYPE_MAPPING:
+                raise ValueError('Unsupported DNS record type id: %s' % type_id)
+            selected.add(RECORD_TYPE_MAPPING[type_id])
+        else:
+            name = token.upper()
+            if name not in RECORD_TYPE_MAPPING.values():
+                raise ValueError('Unsupported DNS record type: %s' % token)
+            selected.add(name)
+    if not selected:
+        return None
+    return selected
+
+
+def filter_records(records, allowed_types):
+    if not allowed_types:
+        return records
+    return [row for row in records if row['type'] in allowed_types]
+
+
+def load_state(path):
+    """Return the stored state dict, or None when no/valid state exists."""
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        with codecs.open(path, 'r', 'utf-8') as statefile:
+            state = json.load(statefile)
+    except (ValueError, OSError) as exc:
+        print_f('Could not read state file %s (%s), performing full export' % (path, exc))
+        return None
+    if state.get('version') != STATE_VERSION or not isinstance(state.get('records'), list):
+        print_f('State file %s has an unknown format, performing full export' % path)
+        return None
+    return state
+
+
+def save_state(path, zone, records, record_types):
+    """Atomically persist the fingerprints of the currently exported records."""
+    state = {
+        'version': STATE_VERSION,
+        'zone': zone,
+        'record_types': sorted(record_types) if record_types else None,
+        'record_count': len(records),
+        'records': sorted(record_key(row) for row in records),
+    }
+    directory = os.path.dirname(os.path.abspath(path))
+    tmpfd, tmppath = tempfile.mkstemp(prefix='.adidnsdump-state-', dir=directory)
+    try:
+        with os.fdopen(tmpfd, 'w', encoding='utf-8') as statefile:
+            json.dump(state, statefile, ensure_ascii=False)
+        os.replace(tmppath, path)
+    except BaseException:
+        try:
+            os.unlink(tmppath)
+        except OSError:
+            pass
+        raise
+
+
+def diff_records(current, previous_keys):
+    """
+    Compare the current export set against the fingerprints stored in a
+    previous state. Returns (added, changed, deleted, unchanged) lists of
+    row dicts. A value change on the same (type, name) pair is reported as
+    a changed record.
+    """
+    previous = set(previous_keys)
+    current_keys = [record_key(row) for row in current]
+    current_set = set(current_keys)
+
+    added = []
+    changed = []
+    unchanged = []
+    current_identities = {}
+    for row, key in zip(current, current_keys):
+        if key in previous:
+            unchanged.append(row)
+        else:
+            identity = (row['type'], row['name'])
+            current_identities.setdefault(identity, []).append(key)
+            added.append(row)
+
+    previous_identities = {}
+    for key in previous:
+        row = key_to_row(key)
+        previous_identities.setdefault((row['type'], row['name']), []).append(key)
+
+    changed_identities = set(previous_identities).intersection(current_identities)
+    if changed_identities:
+        added = [
+            row for row in added
+            if (row['type'], row['name']) not in changed_identities
+        ]
+        for row, key in zip(current, current_keys):
+            identity = (row['type'], row['name'])
+            if identity in changed_identities and key not in previous:
+                changed.append(row)
+
+    deleted = [
+        key_to_row(key) for key in sorted(previous - current_set)
+        if (key_to_row(key)['type'], key_to_row(key)['name']) not in changed_identities
+    ]
+    return added, changed, deleted, unchanged
+
+
+def write_records_csv(path, records):
+    """Write records using the exact same line format as the original tool."""
+    with codecs.open(path, 'w', 'utf-8') as outfile:
+        outfile.write('type,name,value\n')
+        for row in records:
+            outfile.write('{type},{name},{value}\n'.format(**row))
+
+
+def export_records(records, outfile, zone, incremental=False, state_path=None,
+                   record_types=None, deleted_file=None, include_deleted=False):
+    """
+    Handle full/incremental export and state bookkeeping.
+
+    Full export (default): writes all records to outfile, identical to the
+    original behavior, and (for incremental runs) stores a state file.
+    Incremental export: writes only added/changed records to outfile and,
+    when include_deleted is set, deleted records to deleted_file using the
+    same CSV format.
+
+    Returns a dict with counts for reporting.
+    """
+    if state_path is None:
+        state_path = default_state_path(outfile)
+    if not incremental:
+        write_records_csv(outfile, records)
+        return {
+            'mode': 'full',
+            'total': len(records),
+            'added': len(records),
+            'changed': 0,
+            'deleted': 0,
+            'unchanged': 0,
+            'state_path': None,
+            'deleted_file': None,
+        }
+    state = load_state(state_path)
+
+    if state is None or state.get('zone') != zone or state.get('record_types') != (
+            sorted(record_types) if record_types else None):
+        reason = 'no previous state' if state is None else 'zone or filter changed'
+        print_m('Performing full export (%s)' % reason)
+        write_records_csv(outfile, records)
+        save_state(state_path, zone, records, record_types)
+        return {
+            'mode': 'full',
+            'total': len(records),
+            'added': len(records),
+            'changed': 0,
+            'deleted': 0,
+            'unchanged': 0,
+            'state_path': state_path,
+            'deleted_file': None,
+        }
+
+    added, changed, deleted, unchanged = diff_records(records, state['records'])
+    write_records_csv(outfile, added + changed)
+    deleted_path = None
+    if include_deleted:
+        if deleted_file is None:
+            base, ext = os.path.splitext(outfile)
+            deleted_file = base + '.deleted' + ext
+        write_records_csv(deleted_file, deleted)
+        deleted_path = deleted_file
+
+    save_state(state_path, zone, records, record_types)
+    return {
+        'mode': 'incremental',
+        'total': len(records),
+        'added': len(added),
+        'changed': len(changed),
+        'deleted': len(deleted),
+        'unchanged': len(unchanged),
+        'state_path': state_path,
+        'deleted_file': deleted_path,
+    }
+
+def build_parser():
     parser = argparse.ArgumentParser(description='Query/modify DNS records for Active Directory integrated DNS via LDAP')
     parser._optionals.title = "Main options"
     parser._positionals.title = "Required options"
@@ -365,8 +580,29 @@ def main():
     parser.add_argument("--dcfilter", action='store_true', help="Use an alternate filter to identify DNS record types")
     parser.add_argument("--sslprotocol", help="SSL version for LDAP connection, can be SSLv23, TLSv1, TLSv1_1 or TLSv1_2")
     parser.add_argument("--outfile", default='records.csv', help="Output file name/path (default: records.csv)")
+    parser.add_argument("--incremental", action='store_true',
+                        help="Incremental export: only write records added or changed since the previous run "
+                             "(tracked in the state file). First run performs a full export")
+    parser.add_argument("--state-file",
+                        help="State file used for incremental exports (default: <outfile>.state.json)")
+    parser.add_argument("-t", "--record-types",
+                        help="Comma-separated record types to export, e.g. 'A,AAAA,CNAME' or numeric ids '1,28'")
+    parser.add_argument("--include-deleted", action='store_true',
+                        help="In incremental mode, also write records removed since the previous run to a deleted CSV")
+    parser.add_argument("--deleted-file",
+                        help="Output file for deleted records in incremental mode (default: <outfile>.deleted.csv)")
+    return parser
+
+
+def main():
+    parser = build_parser()
 
     args = parser.parse_args()
+    try:
+        allowed_types = parse_record_type_filter(args.record_types)
+    except ValueError as exc:
+        print_f(str(exc))
+        sys.exit(1)
     #Prompt for password if not set
     authentication = None
     if args.user is not None:
@@ -551,11 +787,33 @@ def main():
                     print_m('Unexpected record type seen: {}'.format(dr['Type']))
 
             continue
-    print_o(f'Found {len(outdata)} records, saving to {args.outfile}')
-    with codecs.open(args.outfile, 'w', 'utf-8') as outfile:
-        outfile.write('type,name,value\n')
-        for row in outdata:
-            outfile.write('{type},{name},{value}\n'.format(**row))
+    total_found = len(outdata)
+    outdata = filter_records(outdata, allowed_types)
+    if allowed_types:
+        print_m('Record type filter: %s (%d of %d records kept)'
+                % (','.join(sorted(allowed_types)), len(outdata), total_found))
+    state_path = args.state_file or default_state_path(args.outfile)
+    result = export_records(
+        outdata, args.outfile, zone,
+        incremental=args.incremental,
+        state_path=state_path,
+        record_types=allowed_types,
+        deleted_file=args.deleted_file,
+        include_deleted=args.include_deleted,
+    )
+    if result['mode'] == 'full':
+        print_o(f'Found {total_found} records, saved {result["total"]} to {args.outfile}')
+        if args.incremental:
+            print_m('State written to %s, next run with --incremental exports only changes'
+                    % result['state_path'])
+    else:
+        print_o('Incremental export: %d added, %d changed, %d deleted (%d unchanged) of %d current records'
+                % (result['added'], result['changed'], result['deleted'],
+                   result['unchanged'], result['total']))
+        print_o('Changes saved to %s' % args.outfile)
+        if args.include_deleted:
+            print_m('Deleted records saved to %s' % result['deleted_file'])
+        print_m('State updated: %s' % result['state_path'])
 
 if __name__ == '__main__':
     main()

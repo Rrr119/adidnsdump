@@ -1,0 +1,17 @@
+{
+  "root": "/home/dev/feedback/uid34536",
+  "B": "/home/dev/feedback/uid34536",
+  "sha": "f85f99327ebc80995f37c08e007a33f5943f398a",
+  "wslDistro": "Ubuntu-26.04",
+  "source": {
+    "owner": "dirkjanm",
+    "repo": "adidnsdump",
+    "sha": "f85f99327ebc80995f37c08e007a33f5943f398a"
+  },
+  "fork": {
+    "owner": "Rrr119",
+    "repo": "adidnsdump",
+    "cloneUrl": "https://github.com/Rrr119/adidnsdump.git"
+  },
+  "at": "2026-11-22T23:57:08.900Z"
+}
